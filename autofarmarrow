@@ -1,0 +1,743 @@
+--[[
+	ARROW AUTO FARM v3.1 (crash-fixed)
+	Target: Workspace.Game.ItemSpawnNodes.Arrows.Arrow01 -> Arrow09
+	Pickup: press H while standing on the arrow (plus prompt/click/touch fallbacks)
+
+	Use: execute, then click START FARM.
+]]
+
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UIS       = game:GetService("UserInputService")
+local VIM       = game:GetService("VirtualInputManager")
+
+local LP = Players.LocalPlayer
+
+if getgenv and getgenv()._ArrowFarmCleanup then
+	pcall(getgenv()._ArrowFarmCleanup)
+end
+
+--------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------
+local CONFIG = {
+	Prefix      = "Arrow",
+	Min         = 1,
+	Max         = 9,
+	WaitAtArrow = 0.35,
+	OffsetY     = 3,
+	GrabRadius  = 16,
+	GrabKey     = Enum.KeyCode.H,
+	ToggleKey   = Enum.KeyCode.RightShift,
+	MaxSweep    = 8,      -- hard cap on parts touched per grabAround
+	PostFarmWait = 0.1,   -- yield between farm iterations
+}
+
+local state = {
+	running    = false,
+	current    = "-",
+	arrowsDone = 0,
+	selected   = {},
+	detect     = "scanning…",
+}
+
+for i = CONFIG.Min, CONFIG.Max do
+	state.selected[string.format("%s%02d", CONFIG.Prefix, i)] = true
+end
+
+--------------------------------------------------------------------
+-- KEY PRESS  (H)
+--------------------------------------------------------------------
+local keyMethod = "none"
+
+local function sendKey(key)
+	if type(keypress) == "function" then
+		local code = (key == Enum.KeyCode.H) and 0x48 or 0x48
+		local ok = pcall(function()
+			keypress(code)
+			task.wait(0.03)
+			keyrelease(code)
+		end)
+		if ok then keyMethod = "keypress()"; return true end
+	end
+
+	local ok2 = pcall(function()
+		VIM:SendKeyEvent(true, key, false, game)
+		task.wait(0.03)
+		VIM:SendKeyEvent(false, key, false, game)
+	end)
+	if ok2 then keyMethod = "VirtualInputManager"; return true end
+
+	keyMethod = "FAILED"
+	return false
+end
+
+local function pressGrabKey(times)
+	for _ = 1, (times or 2) do
+		sendKey(CONFIG.GrabKey)
+		task.wait(0.07)
+	end
+end
+
+--------------------------------------------------------------------
+-- WORLD
+--------------------------------------------------------------------
+local function getGameModel()
+	return Workspace:FindFirstChild("Game") or Workspace:FindFirstChild("Game", true)
+end
+
+local function getArrowsFolder()
+	local g = getGameModel()
+	if not g then return nil end
+	local nodes = g:FindFirstChild("ItemSpawnNodes")
+	if not nodes then return nil end
+	return nodes:FindFirstChild("Arrows")
+end
+
+local function getRoot()
+	local char = LP.Character
+	if not char or not char.Parent then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if hum and hrp and hum.Health > 0 then return hrp, hum, char end
+	return nil
+end
+
+local function getArrow(name)
+	local folder = getArrowsFolder()
+	if not folder then return nil end
+	local node = folder:FindFirstChild(name)
+	if node and node:IsA("BasePart") then return node end
+	return nil
+end
+
+local function getSelectedArrows()
+	local list = {}
+	for i = CONFIG.Min, CONFIG.Max do
+		local name = string.format("%s%02d", CONFIG.Prefix, i)
+		if state.selected[name] then
+			local part = getArrow(name) or getArrow(CONFIG.Prefix .. i)
+			if part then list[#list + 1] = part end
+		end
+	end
+	return list
+end
+
+--------------------------------------------------------------------
+-- TELEPORT  (no MoveTo — that was the crash)
+--------------------------------------------------------------------
+local function teleportTo(pos)
+	local hrp, hum, char = getRoot()
+	if not hrp then return false end
+
+	-- method 1: root part CFrame
+	pcall(function()
+		hrp.CFrame = CFrame.new(pos)
+		hrp.AssemblyLinearVelocity  = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end)
+	task.wait(0.1)
+	if (hrp.Position - pos).Magnitude <= 6 then return true end
+
+	-- method 2: pivot entire character
+	pcall(function() char:PivotTo(CFrame.new(pos)) end)
+	task.wait(0.15)
+	if (hrp.Position - pos).Magnitude <= 6 then return true end
+
+	-- deliberately NOT using hum:MoveTo — it fights the next teleport and crashes
+	return false
+end
+
+--------------------------------------------------------------------
+-- GRAB
+--------------------------------------------------------------------
+local function usePrompts(inst)
+	if not inst or not inst.Parent then return end
+	local prompts, maxHold = {}, 0
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled then
+			prompts[#prompts + 1] = d
+			maxHold = math.max(maxHold, d.HoldDuration or 0)
+		end
+	end
+	if #prompts == 0 then return end
+
+	-- cap hold time so we never block the loop for more than ~0.5s
+	maxHold = math.min(maxHold, 0.5)
+
+	for _, p in ipairs(prompts) do
+		if p and p.Parent then pcall(function() p:InputHoldBegin() end) end
+	end
+	if maxHold > 0 then task.wait(maxHold + 0.05) end
+	for _, p in ipairs(prompts) do
+		if p and p.Parent then pcall(function() p:InputHoldEnd() end) end
+	end
+end
+
+local function clickOn(inst)
+	if type(fireclickdetector) ~= "function" then return end
+	if not inst or not inst.Parent then return end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("ClickDetector") and d.Parent then
+			pcall(function() fireclickdetector(d) end)
+		end
+	end
+end
+
+local function touchPart(part, hrp)
+	if type(firetouchinterest) ~= "function" then return end
+	if not part or not part.Parent or not hrp or not hrp.Parent then return end
+	pcall(function() firetouchinterest(part, hrp, 0) end)
+	task.defer(function()
+		if part and part.Parent and hrp and hrp.Parent then
+			pcall(function() firetouchinterest(part, hrp, 1) end)
+		end
+	end)
+end
+
+local function grabAround(hrp, skip)
+	if not hrp or not hrp.Parent then return end
+	pressGrabKey(2)
+
+	local folder = getArrowsFolder()
+	local container = folder and folder.Parent
+	if not container then return end
+
+	local touched = 0
+	for _, d in ipairs(container:GetDescendants()) do
+		if touched >= CONFIG.MaxSweep then break end
+		if d:IsA("BasePart") and d ~= skip and d.Parent
+		and (d.Position - hrp.Position).Magnitude <= CONFIG.GrabRadius then
+			touched += 1
+			clickOn(d)
+			touchPart(d, hrp)
+			task.wait(0.02)
+		end
+	end
+end
+
+local function farmArrow(arrow)
+	if not arrow or not arrow.Parent then return false end
+	local hrp = getRoot()
+	if not hrp then return false end
+
+	local pos = arrow.Position + Vector3.new(0, CONFIG.OffsetY, 0)
+	local reached = teleportTo(pos)
+
+	-- re-validate character after the yield
+	hrp = getRoot()
+	if not hrp then return false end
+
+	-- primary: press H
+	pressGrabKey(2)
+
+	-- re-validate again (keypress yields ~0.14s)
+	hrp = getRoot()
+	if not hrp then return false end
+
+	task.wait(math.max(CONFIG.WaitAtArrow - 0.14, 0.03))
+
+	-- secondary: prompts / clicks / touch (only on this arrow)
+	usePrompts(arrow)
+	clickOn(arrow)
+	touchPart(arrow, hrp)
+
+	-- final sweep — capped
+	grabAround(hrp, arrow)
+
+	return reached
+end
+
+--------------------------------------------------------------------
+-- LOOP
+--------------------------------------------------------------------
+local alive = true
+
+task.spawn(function()
+	while alive do
+		if state.running then
+			local folder = getArrowsFolder()
+			if not folder then
+				state.detect = "Arrows folder NOT FOUND"
+				refreshUI()
+				task.wait(1)
+			else
+				local arrows = getSelectedArrows()
+				state.detect = string.format("%d arrow(s) detected", #arrows)
+				refreshUI()
+
+				if #arrows == 0 then
+					task.wait(0.5)
+				else
+					for _, arrow in ipairs(arrows) do
+						if not state.running or not alive then break end
+						if not arrow.Parent then continue end
+
+						state.current = arrow.Name
+						refreshUI()
+
+						local ok = farmArrow(arrow)
+						if ok then state.arrowsDone += 1 end
+						refreshUI()
+
+						task.wait(CONFIG.PostFarmWait)
+					end
+				end
+			end
+		end
+		task.wait(state.running and 0 or 0.15)
+	end
+end)
+
+--------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------
+local THEME = {
+	bg     = Color3.fromRGB(22, 24, 30),
+	card   = Color3.fromRGB(31, 34, 42),
+	card2  = Color3.fromRGB(38, 42, 51),
+	accent = Color3.fromRGB(70, 205, 120),
+	danger = Color3.fromRGB(200, 70, 85),
+	text   = Color3.fromRGB(235, 238, 245),
+	sub    = Color3.fromRGB(150, 157, 172),
+	stroke = Color3.fromRGB(52, 57, 68),
+}
+
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do inst[k] = v end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function corner(inst, r)
+	new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, inst)
+end
+
+local gui = new("ScreenGui", {
+	Name = "ArrowFarmUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, (gethui and gethui()) or LP:WaitForChild("PlayerGui"))
+
+local WIN_W, WIN_H = 320, 440
+
+local win = new("Frame", {
+	Name = "Window",
+	Size = UDim2.fromOffset(WIN_W, WIN_H),
+	Position = UDim2.new(0, 30, 0.5, -WIN_H / 2),
+	BackgroundColor3 = THEME.bg,
+	BorderSizePixel = 0,
+}, gui)
+corner(win, 12)
+new("UIStroke", { Color = THEME.stroke, Thickness = 1 }, win)
+
+local bar = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = THEME.card,
+	BorderSizePixel = 0,
+}, win)
+corner(bar, 12)
+local barBottom = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 14),
+	Position = UDim2.new(0, 0, 1, -14),
+	BackgroundColor3 = THEME.card,
+	BorderSizePixel = 0,
+}, bar)
+barBottom.ZIndex = 1
+
+local accentBar = new("Frame", {
+	Size = UDim2.fromOffset(6, 18),
+	Position = UDim2.new(0, 14, 0.5, -9),
+	BackgroundColor3 = THEME.accent,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, bar)
+corner(accentBar, 3)
+
+new("TextLabel", {
+	Size = UDim2.new(1, -80, 1, 0),
+	Position = UDim2.fromOffset(28, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Text = "ARROW AUTO FARM",
+	TextSize = 13,
+	TextColor3 = THEME.text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 2,
+}, bar)
+
+local minBtn = new("TextButton", {
+	Size = UDim2.fromOffset(26, 22),
+	Position = UDim2.new(1, -36, 0.5, -11),
+	BackgroundColor3 = THEME.card2,
+	Text = "—",
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = THEME.sub,
+	AutoButtonColor = false,
+	ZIndex = 2,
+}, bar)
+corner(minBtn, 6)
+
+local body = new("Frame", {
+	Size = UDim2.new(1, -24, 1, -52),
+	Position = UDim2.fromOffset(12, 46),
+	BackgroundTransparency = 1,
+}, win)
+
+-- status
+local statusCard = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 58),
+	BackgroundColor3 = THEME.card,
+	BorderSizePixel = 0,
+}, body)
+corner(statusCard, 10)
+
+local dot = new("Frame", {
+	Size = UDim2.fromOffset(8, 8),
+	Position = UDim2.fromOffset(12, 14),
+	BackgroundColor3 = THEME.sub,
+	BorderSizePixel = 0,
+}, statusCard)
+corner(dot, 4)
+
+local statusLbl = new("TextLabel", {
+	Size = UDim2.new(1, -34, 0, 18),
+	Position = UDim2.fromOffset(28, 9),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	Text = "Idle",
+	TextColor3 = THEME.text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, statusCard)
+
+local infoLbl = new("TextLabel", {
+	Size = UDim2.new(1, -24, 0, 18),
+	Position = UDim2.fromOffset(12, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	Text = "Target: —  ·  Trips: 0",
+	TextColor3 = THEME.sub,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, statusCard)
+
+-- start button
+local startBtn = new("TextButton", {
+	Size = UDim2.new(1, 0, 0, 42),
+	Position = UDim2.new(0, 0, 0, 66),
+	BackgroundColor3 = THEME.accent,
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	Text = "START FARM  (H to grab)",
+	TextColor3 = Color3.fromRGB(12, 24, 16),
+	AutoButtonColor = false,
+}, body)
+corner(startBtn, 10)
+
+-- test row
+local testRow = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 26),
+	Position = UDim2.new(0, 0, 0, 116),
+	BackgroundTransparency = 1,
+}, body)
+
+local function smallBtn(text, x, w, color)
+	local b = new("TextButton", {
+		Size = UDim2.new(w, -3, 1, 0),
+		Position = UDim2.new(x, 0, 0, 0),
+		BackgroundColor3 = THEME.card2,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		Text = text,
+		TextColor3 = THEME.text,
+		AutoButtonColor = false,
+	}, testRow)
+	corner(b, 7)
+	local c = color or THEME.text
+	b.TextColor3 = c
+	return b
+end
+
+local tpTestBtn = smallBtn("TEST TP", 0, 0.5)
+local hTestBtn  = smallBtn("TEST H KEY", 0.5, 0.5)
+
+tpTestBtn.MouseButton1Click:Connect(function()
+	local arrow = getArrow("Arrow01") or getArrow(CONFIG.Prefix .. 1)
+	if not arrow then
+		state.detect = "Arrow01 not found"
+		refreshUI()
+		return
+	end
+	local ok = teleportTo(arrow.Position + Vector3.new(0, CONFIG.OffsetY, 0))
+	state.detect = ok and "TP test: OK" or "TP test: BLOCKED"
+	refreshUI()
+end)
+
+hTestBtn.MouseButton1Click:Connect(function()
+	pressGrabKey(2)
+	state.detect = "H sent via " .. keyMethod
+	refreshUI()
+end)
+
+-- arrow selector
+new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	Position = UDim2.new(0, 2, 0, 148),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	Text = "ARROWS",
+	TextColor3 = THEME.sub,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, body)
+
+local grid = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 60),
+	Position = UDim2.new(0, 0, 0, 168),
+	BackgroundTransparency = 1,
+}, body)
+new("UIGridLayout", {
+	CellSize = UDim2.new(0.3333, -5, 0, 26),
+	CellPadding = UDim2.fromOffset(6, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	FillDirectionMaxCells = 3,
+}, grid)
+
+local arrowButtons = {}
+for i = CONFIG.Min, CONFIG.Max do
+	local name = string.format("%s%02d", CONFIG.Prefix, i)
+	local b = new("TextButton", {
+		LayoutOrder = i,
+		BackgroundColor3 = THEME.card,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		Text = "0" .. i,
+		TextColor3 = THEME.sub,
+		AutoButtonColor = false,
+	}, grid)
+	corner(b, 7)
+	local st = new("UIStroke", { Color = THEME.stroke, Thickness = 1 }, b)
+	arrowButtons[name] = { btn = b, stroke = st }
+
+	b.MouseButton1Click:Connect(function()
+		state.selected[name] = not state.selected[name]
+		refreshUI()
+	end)
+end
+
+-- sliders
+local function makeSlider(label, y, min, max, default, fmt, onChange)
+	new("TextLabel", {
+		Size = UDim2.new(1, -60, 0, 14),
+		Position = UDim2.fromOffset(2, y),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		Text = label,
+		TextColor3 = THEME.sub,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, body)
+
+	local valLbl = new("TextLabel", {
+		Size = UDim2.fromOffset(58, 14),
+		Position = UDim2.new(1, -58, 0, y),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		Text = fmt(default),
+		TextColor3 = THEME.accent,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, body)
+
+	local track = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 6),
+		Position = UDim2.fromOffset(0, y + 20),
+		BackgroundColor3 = THEME.card2,
+		BorderSizePixel = 0,
+	}, body)
+	corner(track, 3)
+
+	local fill = new("Frame", {
+		Size = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+	}, track)
+	corner(fill, 3)
+
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(12, 12),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		BackgroundColor3 = THEME.text,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+	}, track)
+	corner(knob, 6)
+
+	local value = default
+	local dragging = false
+
+	local function setFromX(x)
+		local abs = track.AbsolutePosition.X
+		local w = track.AbsoluteSize.X
+		local alpha = math.clamp((x - abs) / math.max(w, 1), 0, 1)
+		value = math.floor((min + (max - min) * alpha) * 100 + 0.5) / 100
+		fill.Size = UDim2.new(alpha, 0, 1, 0)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+		valLbl.Text = fmt(value)
+		onChange(value)
+	end
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end)
+	UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	value = default
+	local initAlpha = (default - min) / (max - min)
+	fill.Size = UDim2.new(initAlpha, 0, 1, 0)
+	knob.Position = UDim2.new(initAlpha, 0, 0.5, 0)
+end
+
+makeSlider("SPEED  (lower = faster)", 238, 0.15, 1.0, CONFIG.WaitAtArrow,
+	function(v) return string.format("%.2fs", v) end,
+	function(v) CONFIG.WaitAtArrow = v end)
+
+makeSlider("HEIGHT OFFSET", 286, 1, 8, CONFIG.OffsetY,
+	function(v) return string.format("%.1f", v) end,
+	function(v) CONFIG.OffsetY = v end)
+
+makeSlider("GRAB RADIUS", 334, 5, 40, CONFIG.GrabRadius,
+	function(v) return string.format("%.0f", v) end,
+	function(v) CONFIG.GrabRadius = math.floor(v) end)
+
+--------------------------------------------------------------------
+-- REFRESH / TOGGLE
+--------------------------------------------------------------------
+function refreshUI()
+	if state.running then
+		startBtn.Text = "STOP FARM"
+		startBtn.BackgroundColor3 = THEME.danger
+		startBtn.TextColor3 = Color3.fromRGB(255, 245, 245)
+		dot.BackgroundColor3 = THEME.accent
+		statusLbl.Text = state.current ~= "-" and ("Farming · " .. state.current) or "Farming…"
+		statusLbl.TextColor3 = THEME.text
+	else
+		startBtn.Text = "START FARM  (H to grab)"
+		startBtn.BackgroundColor3 = THEME.accent
+		startBtn.TextColor3 = Color3.fromRGB(12, 24, 16)
+		dot.BackgroundColor3 = THEME.sub
+		statusLbl.Text = "Idle"
+		statusLbl.TextColor3 = THEME.sub
+	end
+	infoLbl.Text = string.format("%s  ·  Trips: %d", state.detect, state.arrowsDone)
+
+	for name, o in pairs(arrowButtons) do
+		if state.selected[name] then
+			o.btn.BackgroundColor3 = Color3.fromRGB(32, 58, 44)
+			o.btn.TextColor3 = THEME.accent
+			o.stroke.Color = THEME.accent
+		else
+			o.btn.BackgroundColor3 = THEME.card
+			o.btn.TextColor3 = THEME.sub
+			o.stroke.Color = THEME.stroke
+		end
+	end
+end
+
+local function toggleFarm()
+	state.running = not state.running
+	if not state.running then state.current = "-" end
+	refreshUI()
+end
+
+startBtn.MouseButton1Click:Connect(toggleFarm)
+
+UIS.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == CONFIG.ToggleKey then
+		toggleFarm()
+	end
+end)
+
+-- minimize
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	win.Size = minimized and UDim2.fromOffset(WIN_W, 40) or UDim2.fromOffset(WIN_W, WIN_H)
+	minBtn.Text = minimized and "+" or "—"
+end)
+
+-- drag
+do
+	local dragging, dragStart, startPos = false, nil, nil
+	bar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = win.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			win.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+	UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+-- detection feedback on load
+do
+	local folder = getArrowsFolder()
+	if folder then
+		local n = 0
+		for _, c in ipairs(folder:GetChildren()) do
+			if c:IsA("BasePart") then n += 1 end
+		end
+		state.detect = string.format("%d arrow(s) detected", n)
+	else
+		state.detect = "Arrows folder NOT FOUND"
+	end
+end
+
+refreshUI()
+
+if getgenv then
+	getgenv()._ArrowFarmCleanup = function()
+		alive = false
+		state.running = false
+		pcall(function() gui:Destroy() end)
+	end
+end
+
+print("[Arrow Farm v3.1] loaded · grab key: H · toggle: RightShift")
