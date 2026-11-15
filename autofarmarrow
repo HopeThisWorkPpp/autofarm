@@ -1,15 +1,13 @@
 --[[
-	ARROW AUTO FARM v3.2 (mobile-safe)
+	ARROW AUTO FARM v3.3 (mobile, no-synthetic-key)
 	Target: Workspace.Game.ItemSpawnNodes.Arrows.Arrow01 -> Arrow09
-	Pickup: press H while standing on the arrow (plus prompt/click/touch fallbacks)
-
+	Pickup: ProximityPrompt / ClickDetector / touch — NO keypress()
 	Use: execute, then click START FARM.
 ]]
 
-local Players   = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-local UIS       = game:GetService("UserInputService")
-local VIM       = game:GetService("VirtualInputManager")
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
+local UIS        = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
 local LP = Players.LocalPlayer
@@ -18,27 +16,18 @@ if getgenv and getgenv()._ArrowFarmCleanup then
 	pcall(getgenv()._ArrowFarmCleanup)
 end
 
---------------------------------------------------------------------
--- PLATFORM DETECTION
---------------------------------------------------------------------
 local IS_MOBILE = UIS.TouchEnabled and not UIS.MouseEnabled
-local HAS_KEYPRESS = type(keypress) == "function" and type(keyrelease) == "function"
 
---------------------------------------------------------------------
--- CONFIG
---------------------------------------------------------------------
 local CONFIG = {
-	Prefix      = "Arrow",
-	Min         = 1,
-	Max         = 9,
-	WaitAtArrow = IS_MOBILE and 0.7 or 0.35,   -- mobile needs more time
-	OffsetY     = 3,
-	GrabRadius  = 16,
-	GrabKey     = Enum.KeyCode.H,
-	ToggleKey   = Enum.KeyCode.RightShift,
-	MaxSweep    = IS_MOBILE and 4 or 8,
-	PostFarmWait = IS_MOBILE and 0.25 or 0.1,
-	AnchorWindow = 0.35,   -- max time HRP stays anchored
+	Prefix       = "Arrow",
+	Min          = 1,
+	Max          = 9,
+	WaitAtArrow  = IS_MOBILE and 0.8 or 0.4,
+	OffsetY      = 3,
+	GrabRadius   = 20,
+	PostFarmWait = IS_MOBILE and 0.3 or 0.1,
+	AnchorWindow = 0.35,
+	PromptHold   = 0.5,
 }
 
 local state = {
@@ -51,46 +40,6 @@ local state = {
 
 for i = CONFIG.Min, CONFIG.Max do
 	state.selected[string.format("%s%02d", CONFIG.Prefix, i)] = true
-end
-
---------------------------------------------------------------------
--- KEY PRESS  (H)  — mobile-aware
---------------------------------------------------------------------
-local keyMethod = "none"
-
-local function sendKey(key)
-	-- keypress() is the ONLY reliable method on mobile.
-	-- VIM:SendKeyEvent is a no-op or crashes on touch clients.
-	if HAS_KEYPRESS then
-		local code = 0x48  -- H
-		local ok = pcall(function()
-			keypress(code)
-			task.wait(IS_MOBILE and 0.06 or 0.03)
-			keyrelease(code)
-		end)
-		if ok then keyMethod = "keypress()"; return true end
-	end
-
-	if not IS_MOBILE then
-		local ok2 = pcall(function()
-			VIM:SendKeyEvent(true, key, false, game)
-			task.wait(0.03)
-			VIM:SendKeyEvent(false, key, false, game)
-		end)
-		if ok2 then keyMethod = "VirtualInputManager"; return true end
-	end
-
-	keyMethod = "FAILED"
-	return false
-end
-
-local function pressGrabKey(times)
-	local ok = false
-	for _ = 1, (times or 2) do
-		ok = sendKey(CONFIG.GrabKey) or ok
-		task.wait(IS_MOBILE and 0.12 or 0.07)
-	end
-	return ok
 end
 
 --------------------------------------------------------------------
@@ -138,25 +87,20 @@ local function getSelectedArrows()
 end
 
 --------------------------------------------------------------------
--- TELEPORT  — anchor / move / unanchor  (mobile-safe)
+-- TELEPORT (anchored — proven working by TEST TP)
 --------------------------------------------------------------------
 local function teleportTo(pos)
 	local hrp, hum, char = getRoot()
 	if not hrp then return false end
 
-	-- Anchor HRP so physics replication doesn't fight the move.
-	-- This is the #1 fix for mobile crash-on-teleport.
 	local wasAnchored = hrp.Anchored
 	pcall(function() hrp.Anchored = true end)
-
 	pcall(function()
 		hrp.CFrame = CFrame.new(pos)
 		hrp.AssemblyLinearVelocity  = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
 	end)
 
-	-- Keep it anchored for a brief window so the server receives the
-	-- new position cleanly, then release.
 	local t0 = tick()
 	while tick() - t0 < CONFIG.AnchorWindow do
 		RunService.Heartbeat:Wait()
@@ -164,12 +108,10 @@ local function teleportTo(pos)
 
 	pcall(function() hrp.Anchored = wasAnchored end)
 
-	-- verify
 	local hrp2 = getRoot()
 	if not hrp2 then return false end
 	if (hrp2.Position - pos).Magnitude <= 10 then return true end
 
-	-- fallback: PivotTo (also anchored-safe because we just released)
 	pcall(function() char:PivotTo(CFrame.new(pos)) end)
 	task.wait(IS_MOBILE and 0.2 or 0.1)
 	hrp2 = getRoot()
@@ -178,10 +120,10 @@ local function teleportTo(pos)
 end
 
 --------------------------------------------------------------------
--- GRAB  — mobile-aware, heavily guarded
+-- GRAB  — NO keypress. Only prompt / click / touch.
 --------------------------------------------------------------------
-local function usePrompts(inst)
-	if not inst or not inst.Parent then return end
+local function firePrompts(inst)
+	if not inst or not inst.Parent then return 0 end
 	local prompts, maxHold = {}, 0
 	for _, d in ipairs(inst:GetDescendants()) do
 		if d:IsA("ProximityPrompt") and d.Enabled then
@@ -189,8 +131,8 @@ local function usePrompts(inst)
 			maxHold = math.max(maxHold, d.HoldDuration or 0)
 		end
 	end
-	if #prompts == 0 then return end
-	maxHold = math.min(maxHold, 0.4)
+	if #prompts == 0 then return 0 end
+	maxHold = math.min(maxHold, CONFIG.PromptHold)
 
 	for _, p in ipairs(prompts) do
 		if p and p.Parent then pcall(function() p:InputHoldBegin() end) end
@@ -199,51 +141,61 @@ local function usePrompts(inst)
 	for _, p in ipairs(prompts) do
 		if p and p.Parent then pcall(function() p:InputHoldEnd() end) end
 	end
+	return #prompts
 end
 
-local function clickOn(inst)
-	if type(fireclickdetector) ~= "function" then return end
-	if not inst or not inst.Parent then return end
+local function fireClicks(inst)
+	if type(fireclickdetector) ~= "function" then return 0 end
+	if not inst or not inst.Parent then return 0 end
+	local n = 0
 	for _, d in ipairs(inst:GetDescendants()) do
 		if d:IsA("ClickDetector") and d.Parent then
+			n += 1
 			pcall(function() fireclickdetector(d) end)
 		end
 	end
+	return n
 end
 
-local function touchPart(part, hrp)
-	if type(firetouchinterest) ~= "function" then return end
-	if not part or not part.Parent or not hrp or not hrp.Parent then return end
-	-- On mobile, firetouchinterest while anchored can crash. Only touch
-	-- when unanchored.
-	if hrp.Anchored then return end
+local function fireTouch(part, hrp)
+	if type(firetouchinterest) ~= "function" then return false end
+	if not part or not part.Parent or not hrp or not hrp.Parent then return false end
+	if hrp.Anchored then return false end
 	pcall(function() firetouchinterest(part, hrp, 0) end)
 	task.defer(function()
 		if part and part.Parent and hrp and hrp.Parent and not hrp.Anchored then
 			pcall(function() firetouchinterest(part, hrp, 1) end)
 		end
 	end)
+	return true
 end
 
-local function grabAround(hrp, skip)
-	if not hrp or not hrp.Parent then return end
-	pressGrabKey(2)
+local function grabArrow(arrow, hrp)
+	-- Try every non-key interaction method on the arrow itself
+	local n = 0
+	n += firePrompts(arrow)
+	n += fireClicks(arrow)
+	fireTouch(arrow, hrp)
 
+	-- Also sweep nearby parts once (some games put the prompt on a child)
 	local folder = getArrowsFolder()
 	local container = folder and folder.Parent
-	if not container then return end
-
-	local touched = 0
-	for _, d in ipairs(container:GetDescendants()) do
-		if touched >= CONFIG.MaxSweep then break end
-		if d:IsA("BasePart") and d ~= skip and d.Parent
-		and (d.Position - hrp.Position).Magnitude <= CONFIG.GrabRadius then
-			touched += 1
-			clickOn(d)
-			touchPart(d, hrp)
-			task.wait(IS_MOBILE and 0.05 or 0.02)
+	if container and hrp and hrp.Parent then
+		local touched = 0
+		for _, d in ipairs(container:GetDescendants()) do
+			if touched >= (IS_MOBILE and 3 or 6) then break end
+			if d:IsA("BasePart") and d ~= arrow and d.Parent
+			and (d.Position - hrp.Position).Magnitude <= CONFIG.GrabRadius then
+				touched += 1
+				firePrompts(d)
+				fireClicks(d)
+				fireTouch(d, hrp)
+				task.wait(IS_MOBILE and 0.06 or 0.03)
+			end
 		end
 	end
+
+	return n > 0
 end
 
 local function farmArrow(arrow)
@@ -257,24 +209,16 @@ local function farmArrow(arrow)
 	hrp = getRoot()
 	if not hrp then return false end
 
-	pressGrabKey(2)
-
+	task.wait(CONFIG.WaitAtArrow)
 	hrp = getRoot()
 	if not hrp then return false end
 
-	task.wait(math.max(CONFIG.WaitAtArrow - 0.14, 0.03))
-
-	usePrompts(arrow)
-	clickOn(arrow)
-	touchPart(arrow, hrp)
-
-	grabAround(hrp, arrow)
-
+	grabArrow(arrow, hrp)
 	return reached
 end
 
 --------------------------------------------------------------------
--- LOOP  — wrapped in pcall so one bad arrow can't kill the client
+-- LOOP
 --------------------------------------------------------------------
 local alive = true
 
@@ -310,7 +254,6 @@ task.spawn(function()
 					pcall(function() ok = farmArrow(arrow) end)
 					if ok then state.arrowsDone += 1 end
 					refreshUI()
-
 					task.wait(CONFIG.PostFarmWait)
 				end
 			end)
@@ -323,13 +266,13 @@ end)
 -- UI
 --------------------------------------------------------------------
 local THEME = {
-	bg     = Color3.fromRGB(22, 24, 30),
-	card   = Color3.fromRGB(31, 34, 42),
-	card2  = Color3.fromRGB(38, 42, 51),
+	bg = Color3.fromRGB(22, 24, 30),
+	card = Color3.fromRGB(31, 34, 42),
+	card2 = Color3.fromRGB(38, 42, 51),
 	accent = Color3.fromRGB(70, 205, 120),
 	danger = Color3.fromRGB(200, 70, 85),
-	text   = Color3.fromRGB(235, 238, 245),
-	sub    = Color3.fromRGB(150, 157, 172),
+	text = Color3.fromRGB(235, 238, 245),
+	sub = Color3.fromRGB(150, 157, 172),
 	stroke = Color3.fromRGB(52, 57, 68),
 }
 
@@ -339,7 +282,6 @@ local function new(class, props, parent)
 	if parent then inst.Parent = parent end
 	return inst
 end
-
 local function corner(inst, r)
 	new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, inst)
 end
@@ -352,7 +294,6 @@ local gui = new("ScreenGui", {
 }, (gethui and gethui()) or LP:WaitForChild("PlayerGui"))
 
 local WIN_W, WIN_H = 320, 440
-
 local win = new("Frame", {
 	Name = "Window",
 	Size = UDim2.fromOffset(WIN_W, WIN_H),
@@ -460,19 +401,20 @@ local startBtn = new("TextButton", {
 	BackgroundColor3 = THEME.accent,
 	Font = Enum.Font.GothamBold,
 	TextSize = 14,
-	Text = "START FARM  (H to grab)",
+	Text = "START FARM  (no keypress)",
 	TextColor3 = Color3.fromRGB(12, 24, 16),
 	AutoButtonColor = false,
 }, body)
 corner(startBtn, 10)
 
+-- Test row: only a "Test Grab" button now (no H key)
 local testRow = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 26),
 	Position = UDim2.new(0, 0, 0, 116),
 	BackgroundTransparency = 1,
 }, body)
 
-local function smallBtn(text, x, w, color)
+local function smallBtn(text, x, w)
 	local b = new("TextButton", {
 		Size = UDim2.new(w, -3, 1, 0),
 		Position = UDim2.new(x, 0, 0, 0),
@@ -484,13 +426,11 @@ local function smallBtn(text, x, w, color)
 		AutoButtonColor = false,
 	}, testRow)
 	corner(b, 7)
-	local c = color or THEME.text
-	b.TextColor3 = c
 	return b
 end
 
 local tpTestBtn = smallBtn("TEST TP", 0, 0.5)
-local hTestBtn  = smallBtn("TEST H KEY", 0.5, 0.5)
+local grabTestBtn = smallBtn("TEST GRAB", 0.5, 0.5)
 
 tpTestBtn.MouseButton1Click:Connect(function()
 	local arrow = getArrow("Arrow01") or getArrow(CONFIG.Prefix .. 1)
@@ -504,9 +444,21 @@ tpTestBtn.MouseButton1Click:Connect(function()
 	refreshUI()
 end)
 
-hTestBtn.MouseButton1Click:Connect(function()
-	pressGrabKey(2)
-	state.detect = "H sent via " .. keyMethod
+grabTestBtn.MouseButton1Click:Connect(function()
+	local arrow = getArrow("Arrow01") or getArrow(CONFIG.Prefix .. 1)
+	if not arrow then
+		state.detect = "Arrow01 not found"
+		refreshUI()
+		return
+	end
+	local hrp = getRoot()
+	if not hrp then
+		state.detect = "No character"
+		refreshUI()
+		return
+	end
+	local got = grabArrow(arrow, hrp)
+	state.detect = got and "GRAB test: interactions fired" or "GRAB test: nothing found"
 	refreshUI()
 end)
 
@@ -643,7 +595,7 @@ local function makeSlider(label, y, min, max, default, fmt, onChange)
 	knob.Position = UDim2.new(initAlpha, 0, 0.5, 0)
 end
 
-makeSlider("SPEED  (lower = faster)", 238, 0.15, 1.0, CONFIG.WaitAtArrow,
+makeSlider("SPEED  (lower = faster)", 238, 0.15, 1.2, CONFIG.WaitAtArrow,
 	function(v) return string.format("%.2fs", v) end,
 	function(v) CONFIG.WaitAtArrow = v end)
 
@@ -655,9 +607,6 @@ makeSlider("GRAB RADIUS", 334, 5, 40, CONFIG.GrabRadius,
 	function(v) return string.format("%.0f", v) end,
 	function(v) CONFIG.GrabRadius = math.floor(v) end)
 
---------------------------------------------------------------------
--- REFRESH / TOGGLE
---------------------------------------------------------------------
 function refreshUI()
 	if state.running then
 		startBtn.Text = "STOP FARM"
@@ -667,7 +616,7 @@ function refreshUI()
 		statusLbl.Text = state.current ~= "-" and ("Farming · " .. state.current) or "Farming…"
 		statusLbl.TextColor3 = THEME.text
 	else
-		startBtn.Text = "START FARM  (H to grab)"
+		startBtn.Text = "START FARM  (no keypress)"
 		startBtn.BackgroundColor3 = THEME.accent
 		startBtn.TextColor3 = Color3.fromRGB(12, 24, 16)
 		dot.BackgroundColor3 = THEME.sub
@@ -675,7 +624,6 @@ function refreshUI()
 		statusLbl.TextColor3 = THEME.sub
 	end
 	infoLbl.Text = string.format("%s  ·  Trips: %d", state.detect, state.arrowsDone)
-
 	for name, o in pairs(arrowButtons) do
 		if state.selected[name] then
 			o.btn.BackgroundColor3 = Color3.fromRGB(32, 58, 44)
@@ -690,11 +638,6 @@ function refreshUI()
 end
 
 local function toggleFarm()
-	if not state.running and not HAS_KEYPRESS then
-		state.detect = "No keypress() — cannot grab on mobile"
-		refreshUI()
-		return
-	end
 	state.running = not state.running
 	if not state.running then state.current = "-" end
 	refreshUI()
@@ -767,5 +710,4 @@ if getgenv then
 	end
 end
 
-print(string.format("[Arrow Farm v3.2] loaded · mobile=%s · keypress=%s · grab: H · toggle: RightShift",
-	tostring(IS_MOBILE), tostring(HAS_KEYPRESS)))
+print("[Arrow Farm v3.3] loaded · no keypress · grab via prompt/click/touch only")
