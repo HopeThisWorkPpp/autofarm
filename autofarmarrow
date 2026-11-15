@@ -1,5 +1,5 @@
 --[[
-	ARROW AUTO FARM v3.1 (crash-fixed)
+	ARROW AUTO FARM v3.2 (mobile-safe)
 	Target: Workspace.Game.ItemSpawnNodes.Arrows.Arrow01 -> Arrow09
 	Pickup: press H while standing on the arrow (plus prompt/click/touch fallbacks)
 
@@ -10,6 +10,7 @@ local Players   = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UIS       = game:GetService("UserInputService")
 local VIM       = game:GetService("VirtualInputManager")
+local RunService = game:GetService("RunService")
 
 local LP = Players.LocalPlayer
 
@@ -18,19 +19,26 @@ if getgenv and getgenv()._ArrowFarmCleanup then
 end
 
 --------------------------------------------------------------------
+-- PLATFORM DETECTION
+--------------------------------------------------------------------
+local IS_MOBILE = UIS.TouchEnabled and not UIS.MouseEnabled
+local HAS_KEYPRESS = type(keypress) == "function" and type(keyrelease) == "function"
+
+--------------------------------------------------------------------
 -- CONFIG
 --------------------------------------------------------------------
 local CONFIG = {
 	Prefix      = "Arrow",
 	Min         = 1,
 	Max         = 9,
-	WaitAtArrow = 0.35,
+	WaitAtArrow = IS_MOBILE and 0.7 or 0.35,   -- mobile needs more time
 	OffsetY     = 3,
 	GrabRadius  = 16,
 	GrabKey     = Enum.KeyCode.H,
 	ToggleKey   = Enum.KeyCode.RightShift,
-	MaxSweep    = 8,      -- hard cap on parts touched per grabAround
-	PostFarmWait = 0.1,   -- yield between farm iterations
+	MaxSweep    = IS_MOBILE and 4 or 8,
+	PostFarmWait = IS_MOBILE and 0.25 or 0.1,
+	AnchorWindow = 0.35,   -- max time HRP stays anchored
 }
 
 local state = {
@@ -46,37 +54,43 @@ for i = CONFIG.Min, CONFIG.Max do
 end
 
 --------------------------------------------------------------------
--- KEY PRESS  (H)
+-- KEY PRESS  (H)  — mobile-aware
 --------------------------------------------------------------------
 local keyMethod = "none"
 
 local function sendKey(key)
-	if type(keypress) == "function" then
-		local code = (key == Enum.KeyCode.H) and 0x48 or 0x48
+	-- keypress() is the ONLY reliable method on mobile.
+	-- VIM:SendKeyEvent is a no-op or crashes on touch clients.
+	if HAS_KEYPRESS then
+		local code = 0x48  -- H
 		local ok = pcall(function()
 			keypress(code)
-			task.wait(0.03)
+			task.wait(IS_MOBILE and 0.06 or 0.03)
 			keyrelease(code)
 		end)
 		if ok then keyMethod = "keypress()"; return true end
 	end
 
-	local ok2 = pcall(function()
-		VIM:SendKeyEvent(true, key, false, game)
-		task.wait(0.03)
-		VIM:SendKeyEvent(false, key, false, game)
-	end)
-	if ok2 then keyMethod = "VirtualInputManager"; return true end
+	if not IS_MOBILE then
+		local ok2 = pcall(function()
+			VIM:SendKeyEvent(true, key, false, game)
+			task.wait(0.03)
+			VIM:SendKeyEvent(false, key, false, game)
+		end)
+		if ok2 then keyMethod = "VirtualInputManager"; return true end
+	end
 
 	keyMethod = "FAILED"
 	return false
 end
 
 local function pressGrabKey(times)
+	local ok = false
 	for _ = 1, (times or 2) do
-		sendKey(CONFIG.GrabKey)
-		task.wait(0.07)
+		ok = sendKey(CONFIG.GrabKey) or ok
+		task.wait(IS_MOBILE and 0.12 or 0.07)
 	end
+	return ok
 end
 
 --------------------------------------------------------------------
@@ -124,32 +138,47 @@ local function getSelectedArrows()
 end
 
 --------------------------------------------------------------------
--- TELEPORT  (no MoveTo — that was the crash)
+-- TELEPORT  — anchor / move / unanchor  (mobile-safe)
 --------------------------------------------------------------------
 local function teleportTo(pos)
 	local hrp, hum, char = getRoot()
 	if not hrp then return false end
 
-	-- method 1: root part CFrame
+	-- Anchor HRP so physics replication doesn't fight the move.
+	-- This is the #1 fix for mobile crash-on-teleport.
+	local wasAnchored = hrp.Anchored
+	pcall(function() hrp.Anchored = true end)
+
 	pcall(function()
 		hrp.CFrame = CFrame.new(pos)
 		hrp.AssemblyLinearVelocity  = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
 	end)
-	task.wait(0.1)
-	if (hrp.Position - pos).Magnitude <= 6 then return true end
 
-	-- method 2: pivot entire character
+	-- Keep it anchored for a brief window so the server receives the
+	-- new position cleanly, then release.
+	local t0 = tick()
+	while tick() - t0 < CONFIG.AnchorWindow do
+		RunService.Heartbeat:Wait()
+	end
+
+	pcall(function() hrp.Anchored = wasAnchored end)
+
+	-- verify
+	local hrp2 = getRoot()
+	if not hrp2 then return false end
+	if (hrp2.Position - pos).Magnitude <= 10 then return true end
+
+	-- fallback: PivotTo (also anchored-safe because we just released)
 	pcall(function() char:PivotTo(CFrame.new(pos)) end)
-	task.wait(0.15)
-	if (hrp.Position - pos).Magnitude <= 6 then return true end
-
-	-- deliberately NOT using hum:MoveTo — it fights the next teleport and crashes
-	return false
+	task.wait(IS_MOBILE and 0.2 or 0.1)
+	hrp2 = getRoot()
+	if not hrp2 then return false end
+	return (hrp2.Position - pos).Magnitude <= 12
 end
 
 --------------------------------------------------------------------
--- GRAB
+-- GRAB  — mobile-aware, heavily guarded
 --------------------------------------------------------------------
 local function usePrompts(inst)
 	if not inst or not inst.Parent then return end
@@ -161,9 +190,7 @@ local function usePrompts(inst)
 		end
 	end
 	if #prompts == 0 then return end
-
-	-- cap hold time so we never block the loop for more than ~0.5s
-	maxHold = math.min(maxHold, 0.5)
+	maxHold = math.min(maxHold, 0.4)
 
 	for _, p in ipairs(prompts) do
 		if p and p.Parent then pcall(function() p:InputHoldBegin() end) end
@@ -187,9 +214,12 @@ end
 local function touchPart(part, hrp)
 	if type(firetouchinterest) ~= "function" then return end
 	if not part or not part.Parent or not hrp or not hrp.Parent then return end
+	-- On mobile, firetouchinterest while anchored can crash. Only touch
+	-- when unanchored.
+	if hrp.Anchored then return end
 	pcall(function() firetouchinterest(part, hrp, 0) end)
 	task.defer(function()
-		if part and part.Parent and hrp and hrp.Parent then
+		if part and part.Parent and hrp and hrp.Parent and not hrp.Anchored then
 			pcall(function() firetouchinterest(part, hrp, 1) end)
 		end
 	end)
@@ -211,7 +241,7 @@ local function grabAround(hrp, skip)
 			touched += 1
 			clickOn(d)
 			touchPart(d, hrp)
-			task.wait(0.02)
+			task.wait(IS_MOBILE and 0.05 or 0.02)
 		end
 	end
 end
@@ -224,66 +254,66 @@ local function farmArrow(arrow)
 	local pos = arrow.Position + Vector3.new(0, CONFIG.OffsetY, 0)
 	local reached = teleportTo(pos)
 
-	-- re-validate character after the yield
 	hrp = getRoot()
 	if not hrp then return false end
 
-	-- primary: press H
 	pressGrabKey(2)
 
-	-- re-validate again (keypress yields ~0.14s)
 	hrp = getRoot()
 	if not hrp then return false end
 
 	task.wait(math.max(CONFIG.WaitAtArrow - 0.14, 0.03))
 
-	-- secondary: prompts / clicks / touch (only on this arrow)
 	usePrompts(arrow)
 	clickOn(arrow)
 	touchPart(arrow, hrp)
 
-	-- final sweep — capped
 	grabAround(hrp, arrow)
 
 	return reached
 end
 
 --------------------------------------------------------------------
--- LOOP
+-- LOOP  — wrapped in pcall so one bad arrow can't kill the client
 --------------------------------------------------------------------
 local alive = true
 
 task.spawn(function()
 	while alive do
 		if state.running then
-			local folder = getArrowsFolder()
-			if not folder then
-				state.detect = "Arrows folder NOT FOUND"
-				refreshUI()
-				task.wait(1)
-			else
+			pcall(function()
+				local folder = getArrowsFolder()
+				if not folder then
+					state.detect = "Arrows folder NOT FOUND"
+					refreshUI()
+					task.wait(1)
+					return
+				end
+
 				local arrows = getSelectedArrows()
 				state.detect = string.format("%d arrow(s) detected", #arrows)
 				refreshUI()
 
 				if #arrows == 0 then
 					task.wait(0.5)
-				else
-					for _, arrow in ipairs(arrows) do
-						if not state.running or not alive then break end
-						if not arrow.Parent then continue end
-
-						state.current = arrow.Name
-						refreshUI()
-
-						local ok = farmArrow(arrow)
-						if ok then state.arrowsDone += 1 end
-						refreshUI()
-
-						task.wait(CONFIG.PostFarmWait)
-					end
+					return
 				end
-			end
+
+				for _, arrow in ipairs(arrows) do
+					if not state.running or not alive then break end
+					if not arrow or not arrow.Parent then continue end
+
+					state.current = arrow.Name
+					refreshUI()
+
+					local ok = false
+					pcall(function() ok = farmArrow(arrow) end)
+					if ok then state.arrowsDone += 1 end
+					refreshUI()
+
+					task.wait(CONFIG.PostFarmWait)
+				end
+			end)
 		end
 		task.wait(state.running and 0 or 0.15)
 	end
@@ -387,7 +417,6 @@ local body = new("Frame", {
 	BackgroundTransparency = 1,
 }, win)
 
--- status
 local statusCard = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 58),
 	BackgroundColor3 = THEME.card,
@@ -425,7 +454,6 @@ local infoLbl = new("TextLabel", {
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, statusCard)
 
--- start button
 local startBtn = new("TextButton", {
 	Size = UDim2.new(1, 0, 0, 42),
 	Position = UDim2.new(0, 0, 0, 66),
@@ -438,7 +466,6 @@ local startBtn = new("TextButton", {
 }, body)
 corner(startBtn, 10)
 
--- test row
 local testRow = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 26),
 	Position = UDim2.new(0, 0, 0, 116),
@@ -483,7 +510,6 @@ hTestBtn.MouseButton1Click:Connect(function()
 	refreshUI()
 end)
 
--- arrow selector
 new("TextLabel", {
 	Size = UDim2.new(1, 0, 0, 16),
 	Position = UDim2.new(0, 2, 0, 148),
@@ -529,7 +555,6 @@ for i = CONFIG.Min, CONFIG.Max do
 	end)
 end
 
--- sliders
 local function makeSlider(label, y, min, max, default, fmt, onChange)
 	new("TextLabel", {
 		Size = UDim2.new(1, -60, 0, 14),
@@ -665,6 +690,11 @@ function refreshUI()
 end
 
 local function toggleFarm()
+	if not state.running and not HAS_KEYPRESS then
+		state.detect = "No keypress() — cannot grab on mobile"
+		refreshUI()
+		return
+	end
 	state.running = not state.running
 	if not state.running then state.current = "-" end
 	refreshUI()
@@ -678,7 +708,6 @@ UIS.InputBegan:Connect(function(input, processed)
 	end
 end)
 
--- minimize
 local minimized = false
 minBtn.MouseButton1Click:Connect(function()
 	minimized = not minimized
@@ -687,7 +716,6 @@ minBtn.MouseButton1Click:Connect(function()
 	minBtn.Text = minimized and "+" or "—"
 end)
 
--- drag
 do
 	local dragging, dragStart, startPos = false, nil, nil
 	bar.InputBegan:Connect(function(input)
@@ -716,7 +744,6 @@ do
 	end)
 end
 
--- detection feedback on load
 do
 	local folder = getArrowsFolder()
 	if folder then
@@ -740,4 +767,5 @@ if getgenv then
 	end
 end
 
-print("[Arrow Farm v3.1] loaded · grab key: H · toggle: RightShift")
+print(string.format("[Arrow Farm v3.2] loaded · mobile=%s · keypress=%s · grab: H · toggle: RightShift",
+	tostring(IS_MOBILE), tostring(HAS_KEYPRESS)))
